@@ -1,0 +1,2 @@
+/home/kyle/borg-backup/openwrt*
+/home/kyle/borg-backup/pi-hole*
