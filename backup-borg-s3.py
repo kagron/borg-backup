@@ -44,7 +44,6 @@ ROUTER_TAR_NAME = "openwrt.tar.gz"
 DEBUG = False
 
 ENV_VARS = (
-    # "DOCKER_DIR",
     "ROUTER_HOST",
     "PIHOLE_HOST",
     "SSH_PRIVATE_KEY_PATH",
@@ -72,21 +71,61 @@ def backup():
 
     borg_repo = os.environ.get("BORG_REPO")
     borg_ext_repo = os.environ.get("BORG_EXTDRIVE_REPO")
-    status = backup_to_repo(borg_repo, create_router_archive, create_pihole_archive)
+
+    # Handled in main method, but this tells pyright to shut up
+    assert borg_repo is not None
+    assert borg_ext_repo is not None
+
+    try:
+        backup_to_repo(borg_repo, create_router_archive, create_pihole_archive)
+    except subprocess.CalledProcessError as error:
+        logger.error("Did not backup to AWS nor ext drive")
+        logger.error(f"Error running command '{error.cmd}'")
+        send_notification("Backup Failed!", error.output)
+        cleanup()
+        start_docker()
+        sys.exit(1)
 
     borg_info = ""
 
-    if status == 0:
+    try:
         prune_repo(borg_repo)
+    except subprocess.CalledProcessError as error:
+        logger.error(f"Failed to prune repo '{borg_repo}'")
+        send_notification(
+            f"Failed to prune repo '{borg_repo}'",
+            error.output,
+        )
+
+    try:
         compact_repo(borg_repo)
-        # Let OS clean up maybe?  Rclone is reporting files are being
-        # modified when rclone starts
-        time.sleep(25)
+    except subprocess.CalledProcessError as error:
+        logger.error(f"Failed to compact repo '{borg_repo}'!")
+        logger.error(error.output)
+        send_notification(f"Failed to compact repo '{borg_repo}'", error.output)
+
+    # Let OS clean up maybe?  Rclone is reporting files are being
+    # modified when rclone starts
+    time.sleep(25)
+
+    try:
         clone(borg_repo, borg_ext_repo)
+    except subprocess.CalledProcessError as error:
+        logger.error("Failed to clone!")
+        logger.error(error.output)
+        send_notification("Failed to clone repos!", error.output)
+
+    try:
         backup_to_aws(borg_repo)
-        borg_info = get_repo_info(borg_repo)
-    else:
-        logger.info("Did not backup to AWS nor ext drive")
+    except subprocess.CalledProcessError as error:
+        logger.error("Failed to backup to AWS!")
+        logger.error(error.output)
+        send_notification("Backup to AWS Failed!", error.output)
+        cleanup()
+        start_docker()
+        sys.exit(1)
+
+    borg_info = get_repo_info(borg_repo)
 
     cleanup()
 
@@ -97,13 +136,10 @@ def backup():
     logger.info(f"Borg repo {borg_repo} stats: \n{borg_info}")
     logger.info(f"AWS bucket size: {aws_bucket_size}")
 
-    if status:
-        send_notification("Backup failed", f"Exit code {status}")
-    else:
-        send_notification(
-            "Backup Successful",
-            f"Borg NAS Stats: \n{borg_info}\nAWS " + f"bucket size: {aws_bucket_size}",
-        )
+    send_notification(
+        "Backup Successful",
+        f"Borg NAS Stats: \n{borg_info}\nAWS " + f"bucket size: {aws_bucket_size}",
+    )
 
 
 def borg_create(
@@ -122,11 +158,11 @@ def borg_create(
         + f"--exclude-from {excludes_file} "
         + "--compression zlib,6"
     ]
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    result = subprocess.run(cmd, check=True, shell=True, capture_output=True, text=True)
 
     log_result(result)
 
-    return result
+    return result.returncode
 
 
 def ssh(host: str, command: str):
@@ -157,19 +193,23 @@ def get_router_backup() -> int:
 
     router_host = os.environ.get("ROUTER_HOST")
     user_and_host = f"root@{router_host}"
+    result = None
 
     try:
-        result = ssh(user_and_host, f"tar -cvzf {ROUTER_TAR_NAME} /etc")
-        result = scp(user_and_host, ROUTER_TAR_NAME, ".")
-        result = ssh(user_and_host, f"rm -rf {ROUTER_TAR_NAME}")
+        log_result(ssh(user_and_host, f"tar -cvzf {ROUTER_TAR_NAME} /etc"))
+        log_result(scp(user_and_host, ROUTER_TAR_NAME, "."))
+        log_result(ssh(user_and_host, f"rm -rf {ROUTER_TAR_NAME}"))
     except subprocess.CalledProcessError as error:
-        log_result(result)
-        send_notification(title="Error retrieving Openwrt.lan backup", message=error)
+        send_notification(
+            title=f"Error retrieving {router_host} backup", message=error.output
+        )
         return 1
 
     os.mkdir(ROUTER_BACKUP_DIR)
 
-    result = subprocess.run(["tar", "xzvf", ROUTER_TAR_NAME, "-C", ROUTER_BACKUP_DIR])
+    result = subprocess.run(
+        ["tar", "xzvf", ROUTER_TAR_NAME, "-C", ROUTER_BACKUP_DIR], check=False
+    )
 
     log_result(result)
 
@@ -182,20 +222,22 @@ def get_pihole_backup() -> int:
 
     pihole_host = os.environ.get("PIHOLE_HOST")
     user_and_host = f"pi@{pihole_host}"
+    result = None
 
     try:
-        result = ssh(user_and_host, "sudo pihole-FTL --teleporter")
-        result = scp(user_and_host, "pi-hole*", ".")
-        result = ssh(user_and_host, "rm -rf pi-hole*")
+        log_result(ssh(user_and_host, "sudo pihole-FTL --teleporter"))
+        log_result(scp(user_and_host, "pi-hole*", "."))
+        log_result(ssh(user_and_host, "rm -rf pi-hole*"))
     except subprocess.CalledProcessError as error:
-        log_result(result)
-        send_notification(title="Error retrieving Pi-Hole backup", message=error)
+        send_notification("Error retrieving Pi-Hole backup", error.output)
         return 1
 
     os.mkdir(PIHOLE_BACKUP_DIR)
 
     result = subprocess.run(
-        [f"unzip pi-hole_raspberrypi_teleporter* -d {PIHOLE_BACKUP_DIR}"], shell=True
+        [f"unzip pi-hole_raspberrypi_teleporter* -d {PIHOLE_BACKUP_DIR}"],
+        shell=True,
+        check=False,
     )
 
     log_result(result)
@@ -205,7 +247,7 @@ def get_pihole_backup() -> int:
 
 def backup_to_repo(
     borg_repo: str, create_router_archive: bool, create_pihole_archive: bool
-) -> int:
+):
     """
     Performs the backups to repo.  Will conditionally back up router and
     pi-hole based on flags
@@ -215,8 +257,12 @@ def backup_to_repo(
     nextcloud_home = os.environ.get("NEXTCLOUD_HOME")
     saves_dir = os.environ.get("SAVES_DIR")
 
+    # Handled in main method, but this tells pyright to shut up
+    assert nextcloud_home is not None
+    assert saves_dir is not None
+
     # Home
-    result = borg_create(
+    borg_create(
         borg_repo=borg_repo,
         backup_name=f"{HOME_BACKUP_PREFIX}-{CURRENT_TIME}",
         backup_dir="/home",
@@ -226,7 +272,7 @@ def backup_to_repo(
 
     # Router
     if create_router_archive:
-        result = borg_create(
+        borg_create(
             borg_repo=borg_repo,
             backup_name=f"{ROUTER_BACKUP_PREFIX}-{CURRENT_TIME}",
             backup_dir=ROUTER_BACKUP_DIR,
@@ -236,7 +282,7 @@ def backup_to_repo(
 
     # Pihole
     if create_pihole_archive:
-        result = borg_create(
+        borg_create(
             borg_repo=borg_repo,
             backup_name=f"{PIHOLE_BACKUP_PREFIX}-{CURRENT_TIME}",
             backup_dir=PIHOLE_BACKUP_DIR,
@@ -245,7 +291,7 @@ def backup_to_repo(
         )
 
     # /etc
-    result = borg_create(
+    borg_create(
         borg_repo=borg_repo,
         backup_name=f"{ETC_BACKUP_PREFIX}-{CURRENT_TIME}",
         backup_dir="/etc",
@@ -254,7 +300,7 @@ def backup_to_repo(
     )
 
     # Nextcloud Home
-    result = borg_create(
+    borg_create(
         borg_repo=borg_repo,
         backup_name=f"{NEXTCLOUD_BACKUP_PREFIX}-{CURRENT_TIME}",
         backup_dir=nextcloud_home,
@@ -263,7 +309,7 @@ def backup_to_repo(
     )
 
     # Saves
-    result = borg_create(
+    borg_create(
         borg_repo=borg_repo,
         backup_name=f"{SAVES_BACKUP_PREFIX}-{CURRENT_TIME}",
         backup_dir=saves_dir,
@@ -271,17 +317,19 @@ def backup_to_repo(
         dry_run=DEBUG,
     )
 
-    return result.returncode
-
 
 def stop_docker():
     """Stops all running docker containers"""
     logger.info("Stopping docker containers")
 
     result = subprocess.run(
-        ["docker stop $(docker ps -a -q)"], shell=True, capture_output=True, text=True
+        ["docker stop $(docker ps -a -q)"],
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    logger.debug(result)
+    log_result(result)
 
 
 def start_docker():
@@ -289,9 +337,13 @@ def start_docker():
     logger.info("Starting docker containers")
 
     result = subprocess.run(
-        ["docker start $(docker ps -a -q)"], shell=True, capture_output=True, text=True
+        ["docker start $(docker ps -a -q)"],
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    logger.debug(result)
+    log_result(result)
 
 
 def send_notification(title: str, message: str, priority=0):
@@ -309,7 +361,10 @@ def send_notification(title: str, message: str, priority=0):
         + f'-F "message={message}" '
         + f'-F "priority={priority}"'
     ]
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # Hopefully this never fails :)
+    result = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, check=False
+    )
 
     log_result(result)
 
@@ -327,70 +382,93 @@ def prune_repo(borg_repo: str):
             shell=True,
             capture_output=True,
             text=True,
+            check=True,
         )
 
         log_result(result)
 
 
-def compact_repo(borg_repo: str) -> int:
+def compact_repo(borg_repo: str):
     """Compact repo to free up deleted data"""
     logger.info(f"Compacting data from repo {borg_repo}")
 
     result = subprocess.run(
-        [f"borg compact -v {borg_repo}"], shell=True, capture_output=True, text=True
+        [f"borg compact -v {borg_repo}"],
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
 
     log_result(result)
-
-    return result.returncode
 
 
 def get_repo_info(borg_repo: str, backup_name="", json=False) -> str:
     """Runs a borg info command"""
     logger.info(f"Running borg info {borg_repo}")
-    result = subprocess.run(
-        [
-            "borg info "
-            + ("--json " if json else "")
-            + borg_repo
-            + (f"::{backup_name}" if backup_name != "" else "")
-        ],
-        capture_output=True,
-        text=True,
-        shell=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "borg info "
+                + ("--json " if json else "")
+                + borg_repo
+                + (f"::{backup_name}" if backup_name != "" else "")
+            ],
+            capture_output=True,
+            text=True,
+            shell=True,
+            check=True,
+        )
 
-    log_result(result)
+        log_result(result)
+    except subprocess.CalledProcessError as error:
+        logger.error("Failed to retrieve borg info!")
+        logger.error(f"Ran command '{error.cmd}'")
+        logger.error(error.output)
+        send_notification("Failed to retrieve borg info!", error.output)
+        return ""
 
-    return result.stdout if not result.returncode else ""
+    return result.stdout
 
 
 def check() -> int:
-    """Runs a borg check command monthly on first Monday"""
+    """
+    Runs a borg check command monthly on first Monday for BORG_REPO
+    and first Tuesday for BORG_EXTDRIVE_REPO
+    """
     today = date.today()
+    result = None
+    repo = None
+
     if today.day >= 1 and today.day <= 7 and today.weekday() == 0:
+        repo = os.environ.get("BORG_REPO")
+    elif today.day >= 1 and today.day <= 7 and today.weekday() == 1:
+        repo = os.environ.get("BORG_EXTDRIVE_REPO")
+
+    if repo is not None:
         logger.info("Running check")
 
-        borg_repo = os.environ.get("BORG_REPO")
-
-        cmd = [f"borg check --verify-data {borg_repo}"]
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        cmd = [f"borg check --verify-data {repo}"]
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, check=False
+        )
         log_result(result)
 
         if result.returncode:
             send_notification(
-                "Check Failed", "Borg check --verify-data failed for " + borg_repo
+                "Check Failed",
+                f"Borg check --verify-data failed for repo '{repo}'",
             )
         else:
             send_notification(
                 "Check Successful",
-                "Borg check --verify-data was successful for " + borg_repo,
+                f"Borg check --verify-data was successful for repo '{repo}'",
             )
 
-    return result.returncode if result else 0
+    return result.returncode if result is not None else 0
 
 
-def clone(source: str, target: str) -> int:
+def clone(source: str, target: str):
     """
     Runs rclone sync to keep backups in sync WITH BORG LOCK
     """
@@ -401,16 +479,10 @@ def clone(source: str, target: str) -> int:
         shell=True,
         text=True,
         capture_output=True,
+        check=True,
     )
 
     log_result(result)
-
-    if result.returncode == 0:
-        logger.debug(result)
-    else:
-        logger.error(result)
-        send_notification(title="Cloning failed", message=result.stderr)
-    return result.returncode
 
 
 def get_backup_size(borg_repo: str, backup_name="") -> int:
@@ -431,6 +503,7 @@ def get_backup_size(borg_repo: str, backup_name="") -> int:
         capture_output=True,
         text=True,
         shell=True,
+        check=False,
     )
 
     log_result(result)
@@ -438,11 +511,11 @@ def get_backup_size(borg_repo: str, backup_name="") -> int:
     return int(result.stdout) if not result.returncode else 0
 
 
-def backup_to_aws(borg_repo: str) -> int:
-    """Syncs borg repo to AWS.  Returns 0 when successful"""
+def backup_to_aws(borg_repo: str):
+    """Syncs borg repo to AWS WITH BORG LOCK."""
     s3_bucket = os.environ.get("BORG_S3_BACKUP_BUCKET")
     s3_profile = os.environ.get("BORG_S3_BACKUP_AWS_PROFILE")
-    backup_threshold = int(os.environ.get("BACKUP_THRESHOLD", 0))
+    backup_threshold = int(os.environ.get("BACKUP_THRESHOLD", "0"))
 
     if backup_threshold > 0:
         backup_size = int(get_backup_size(borg_repo))
@@ -457,57 +530,47 @@ def backup_to_aws(borg_repo: str) -> int:
             return 1
 
     logger.info(f"Syncing to s3 bucket {s3_bucket}")
-    result = subprocess.run(
+    subprocess.run(
         [
             f"borg with-lock {borg_repo} "
             + f"aws s3 sync {borg_repo} s3://{s3_bucket} "
             + f"--profile={s3_profile} --delete"
         ],
         shell=True,
+        check=True,
     )
-
-    if result.returncode == 0:
-        logger.debug(result)
-    else:
-        logger.error(result)
-        send_notification(title="Error syncing with AWS", message=result.stderr)
-
-    return result.returncode
 
 
 def get_aws_bucket_size() -> str:
-    """Syncs borg repo to AWS.  Returns 0 when successful"""
+    """Retrieves current AWS S3 Bucket Size.  Returns AWS bucket size when successful"""
     s3_bucket = os.environ.get("BORG_S3_BACKUP_BUCKET")
     s3_profile = os.environ.get("BORG_S3_BACKUP_AWS_PROFILE")
 
     logger.info(f"Getting aws bucket size {s3_bucket}")
-    try:
-        result = subprocess.run(
-            [
-                f"aws s3 ls --profile={s3_profile} --summarize --recursive "
-                + f"s3://{s3_bucket} | "
-                + "tail -1 | "
-                + "awk '{ printf \"%.3f GB\", $3/1024/1024/1024; }'"
-            ],
-            capture_output=True,
-            text=True,
-            shell=True,
-        )
+    result = subprocess.run(
+        [
+            f"aws s3 ls --profile={s3_profile} --summarize --recursive "
+            + f"s3://{s3_bucket} | "
+            + "tail -1 | "
+            + "awk '{ printf \"%.3f GB\", $3/1024/1024/1024; }'"
+        ],
+        capture_output=True,
+        text=True,
+        shell=True,
+        check=False,
+    )
 
-        log_result(result)
+    log_result(result)
 
-        return result.stdout if not result.returncode else ""
-    except subprocess.CalledProcessError as error:
-        logger.error(error)
-        return ""
+    return result.stdout if not result.returncode else ""
 
 
 def cleanup():
     """Cleans up directory"""
     logger.info("Cleanup")
 
-    logger.debug(subprocess.run(["rm -rf openwrt*"], shell=True))
-    logger.debug(subprocess.run(["rm -rf pi-hole*"], shell=True))
+    logger.debug(subprocess.run(["rm -rf openwrt*"], shell=True, check=False))
+    logger.debug(subprocess.run(["rm -rf pi-hole*"], shell=True, check=False))
 
 
 def log_result(result: subprocess.CompletedProcess):
