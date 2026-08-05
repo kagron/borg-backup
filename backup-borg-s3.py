@@ -181,7 +181,7 @@ def scp(host: str, remote_path: str, local_path: str):
     logger.info(f"Initiating scp command: {host}:{remote_path} {local_path}")
 
     return subprocess.run(
-        [f"scp -i {private_key_path} {host}:{remote_path} {local_path}"],
+        [f"scp -O -i {private_key_path} {host}:{remote_path} {local_path}"],
         check=True,
         shell=True,
     )
