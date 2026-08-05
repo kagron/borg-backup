@@ -180,6 +180,7 @@ def scp(host: str, remote_path: str, local_path: str):
     private_key_path = os.environ.get("SSH_PRIVATE_KEY_PATH")
     logger.info(f"Initiating scp command: {host}:{remote_path} {local_path}")
 
+    # -O to use old legacy SCP protocol instead of SFTP
     return subprocess.run(
         [f"scp -O -i {private_key_path} {host}:{remote_path} {local_path}"],
         check=True,
