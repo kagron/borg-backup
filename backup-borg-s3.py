@@ -53,9 +53,8 @@ ENV_VARS = (
     "BORG_S3_BACKUP_AWS_PROFILE",
     "NEXTCLOUD_HOME",
     "SAVES_DIR",
-    "PUSHOVER_URL",
-    "PUSHOVER_TOKEN",
-    "PUSHOVER_USER_TOKEN",
+    "GOTIFY_URL",
+    "GOTIFY_API_KEY",
 )
 
 
@@ -348,16 +347,15 @@ def start_docker():
 
 
 def send_notification(title: str, message: str, priority=0):
-    """Sends notification to pushover"""
-    logger.info("Sending notification to pushover")
-    pushover_url = os.environ.get("PUSHOVER_URL")
-    pushover_token = os.environ.get("PUSHOVER_TOKEN")
-    pushover_user_token = os.environ.get("PUSHOVER_USER_TOKEN")
+    """Sends notification to gotify"""
+    logger.info("Sending notification to gotify")
+
+    gotify_url = os.environ.get("GOTIFY_URL")
+    gotify_api_key = os.environ.get("GOTIFY_API_KEY")
 
     cmd = [
-        f"curl -s {pushover_url} "
-        + f'-F "token={pushover_token}" '
-        + f'-F "user={pushover_user_token}" '
+        f"curl -s {gotify_url} "
+        + f'-H "X-Gotify-Key: {gotify_api_key}" '
         + f'-F "title={title}" '
         + f'-F "message={message}" '
         + f'-F "priority={priority}"'
